@@ -1,0 +1,45 @@
+# ---- Python 缓存与编译产物 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# ---- 虚拟环境与依赖 ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 构建产物与打包 ----
+build/
+dist/
+*.spec
+*.exe
+
+# ---- 测试与覆盖率 ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 内部工作流产物（不进公开仓库） ----
+docs/superpowers/
+
+# ---- 系统与敏感配置 ----
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+*.log

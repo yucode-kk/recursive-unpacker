@@ -1,0 +1,3 @@
+# Optional format support. The app can still handle ordinary ZIP archives without these.
+py7zr>=1.0.0
+pyzipper>=0.3.6
