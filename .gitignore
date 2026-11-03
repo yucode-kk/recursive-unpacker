@@ -35,6 +35,7 @@ coverage.xml
 
 # ---- 内部工作流产物（不进公开仓库） ----
 docs/superpowers/
+.workbuddy/
 
 # ---- 系统与敏感配置 ----
 .DS_Store
@@ -43,3 +44,7 @@ Thumbs.db
 .env.*
 !.env.example
 *.log
+
+# ---- 本机运行配置（含明文解压密码，禁止提交）----
+config.json
+config.json.bak

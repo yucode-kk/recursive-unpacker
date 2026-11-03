@@ -50,7 +50,9 @@ def _zip_bytes(entries: dict[str, bytes | str]) -> bytes:
     return buffer.getvalue()
 
 
-def test_extracts_nested_zip_and_removes_inner_archive(tmp_path: Path) -> None:
+def test_extracts_nested_zip_and_removes_inner_archive(
+    tmp_path: Path, no_external_backends: None
+) -> None:
     from recursive_unpacker.core import extract_recursive
 
     inner_bytes = _zip_bytes({"deep.txt": "inside"})
@@ -74,7 +76,9 @@ def test_extracts_nested_zip_and_removes_inner_archive(tmp_path: Path) -> None:
     assert report.remaining_archives == []
 
 
-def test_depth_limit_reports_nested_archives_without_deleting_them(tmp_path: Path) -> None:
+def test_depth_limit_reports_nested_archives_without_deleting_them(
+    tmp_path: Path, no_external_backends: None
+) -> None:
     from recursive_unpacker.core import extract_recursive
 
     source = tmp_path / "bundle.zip"
@@ -94,7 +98,9 @@ def test_depth_limit_reports_nested_archives_without_deleting_them(tmp_path: Pat
     assert report.remaining_archives[0].exists()
 
 
-def test_rejects_zip_traversal_before_writing_outside_output(tmp_path: Path) -> None:
+def test_rejects_zip_traversal_before_writing_outside_output(
+    tmp_path: Path, no_external_backends: None
+) -> None:
     from recursive_unpacker.core import ExtractionError, extract_recursive
 
     source = tmp_path / "evil.zip"
@@ -114,7 +120,9 @@ def test_rejects_zip_traversal_before_writing_outside_output(tmp_path: Path) -> 
     assert not outside.exists()
 
 
-def test_encrypted_zip_tries_candidate_passwords(tmp_path: Path) -> None:
+def test_encrypted_zip_tries_candidate_passwords(
+    tmp_path: Path, no_external_backends: None
+) -> None:
     try:
         import pyzipper
     except ImportError:
@@ -162,6 +170,186 @@ def test_encrypted_zip_tries_candidate_passwords(tmp_path: Path) -> None:
     )
 
     assert (report.output_dir / "secret.txt").read_text() == "unlocked"
+    assert report.used_password == "correct-password"
+    assert "correct-password" not in repr(report)
+
+
+def test_report_exposes_used_password_after_bandizip_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import recursive_unpacker.core as core
+
+    source = tmp_path / "world.rar"
+    source.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 20)
+    bandizip = tmp_path / "bz.exe"
+    bandizip.write_bytes(b"fake executable")
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[1] == "l":
+            if "-p:secret" not in command:
+                return SimpleNamespace(returncode=1, stdout=b"wrong password\n")
+            return SimpleNamespace(returncode=0, stdout=b"hello.txt\n")
+        output_dir = Path(next(item for item in command if item.startswith("-o:"))[3:])
+        (output_dir / "hello.txt").write_text("unpacked", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    monkeypatch.setattr(core, "find_7zip_executable", lambda configured_path=None: None)
+
+    report = core.extract_recursive(
+        source,
+        tmp_path / "out",
+        passwords=["wrong", "secret"],
+        bandizip_path=str(bandizip),
+    )
+
+    assert report.used_password == "secret"
+    assert "secret" not in repr(report)
+
+
+def test_report_used_password_is_none_when_no_password_needed(
+    tmp_path: Path, no_external_backends: None
+) -> None:
+    from recursive_unpacker.core import extract_recursive
+
+    source = tmp_path / "plain.zip"
+    source.write_bytes(_zip_bytes({"hello.txt": "hello"}))
+
+    report = extract_recursive(source, tmp_path / "out", passwords=["unused"])
+
+    assert report.used_password is None
+
+
+def test_extraction_report_keeps_positional_construction() -> None:
+    from recursive_unpacker.core import ExtractionReport
+
+    report = ExtractionReport(Path("out"), 2)
+
+    assert report.output_dir == Path("out")
+    assert report.extracted_archives == 2
+    assert report.remaining_archives == []
+    assert report.used_password is None
+
+
+def test_archive_stem_strips_split_volume_suffix() -> None:
+    from recursive_unpacker.core import _archive_stem
+
+    assert _archive_stem(Path("M.7z.001"), [".zip", ".7z", ".rar"]) == "M"
+    assert _archive_stem(Path("M.zip.001"), [".zip", ".7z", ".rar"]) == "M"
+    assert _archive_stem(Path("M.7z.002"), [".zip", ".7z", ".rar"]) == "M"
+
+
+def test_volume_set_is_extracted_from_its_original_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import recursive_unpacker.core as core
+
+    first = tmp_path / "M.7z.001"
+    first.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+    (tmp_path / "M.7z.002").write_bytes(b"\x01" * 32)
+    bandizip = tmp_path / "bz.exe"
+    bandizip.write_bytes(b"fake executable")
+
+    used_paths: list[Path] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        used_paths.append(Path(command[-1]))
+        if command[1] == "l":
+            return SimpleNamespace(returncode=0, stdout=b"payload.bin\n")
+        output_arg = next(item for item in command if item.startswith("-o:"))
+        (Path(output_arg[3:]) / "payload.bin").write_text("ok", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    monkeypatch.setattr(core, "find_7zip_executable", lambda configured_path=None: None)
+
+    report = core.extract_recursive(
+        first,
+        tmp_path / "out",
+        passwords=[],
+        bandizip_path=str(bandizip),
+        max_depth=1,
+    )
+
+    assert report.output_dir.name == "M"
+    assert (report.output_dir / "payload.bin").read_text(encoding="utf-8") == "ok"
+    assert used_paths, "the external backend should have been invoked"
+    assert all(path == first.resolve() for path in used_paths), (
+        "split volumes must be passed by their original path, never a renamed copy"
+    )
+    assert list(tmp_path.glob("candidate*")) == [], "no candidate copy may be created"
+
+
+def test_volume_set_without_external_backend_raises_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import recursive_unpacker.core as core
+
+    first = tmp_path / "M.7z.001"
+    first.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+    (tmp_path / "M.7z.002").write_bytes(b"\x01" * 32)
+    monkeypatch.setattr(core, "find_bandizip_executable", lambda configured_path=None: None)
+    monkeypatch.setattr(core, "find_7zip_executable", lambda configured_path=None: None)
+
+    with pytest.raises(core.ExtractionError, match="分卷压缩包需要外部解压程序"):
+        core.extract_recursive(first, tmp_path / "out", passwords=[], max_depth=1)
+
+
+def test_volume_set_reports_the_missing_piece(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import recursive_unpacker.core as core
+
+    first = tmp_path / "M.7z.001"
+    first.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+    (tmp_path / "M.7z.003").write_bytes(b"\x02" * 32)
+    bandizip = tmp_path / "bz.exe"
+    bandizip.write_bytes(b"fake executable")
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=1, stdout=b"corrupt or missing volume\n")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    monkeypatch.setattr(core, "find_7zip_executable", lambda configured_path=None: None)
+
+    with pytest.raises(core.ExtractionError, match=r"缺少分卷 \.002"):
+        core.extract_recursive(
+            first,
+            tmp_path / "out",
+            passwords=[],
+            bandizip_path=str(bandizip),
+            max_depth=1,
+        )
+
+
+def test_delete_nested_archive_removes_the_whole_volume_set(tmp_path: Path) -> None:
+    from recursive_unpacker.core import _delete_nested_archive
+
+    for index in (1, 2, 3):
+        (tmp_path / f"M.7z.{index:03d}").write_bytes(b"x")
+    warnings: list[str] = []
+
+    _delete_nested_archive(tmp_path / "M.7z.001", tmp_path, None, warnings)
+
+    assert not any(tmp_path.glob("M.7z.*"))
+    assert warnings == []
+
+
+def test_delete_nested_archive_keeps_single_archive_behaviour(tmp_path: Path) -> None:
+    from recursive_unpacker.core import _delete_nested_archive
+
+    archive = tmp_path / "single.zip"
+    archive.write_bytes(b"x")
+
+    _delete_nested_archive(archive, tmp_path, None, [])
+
+    assert not archive.exists()
 
 
 def test_gui_module_imports_without_creating_a_window() -> None:

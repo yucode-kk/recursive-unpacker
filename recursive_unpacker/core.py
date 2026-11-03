@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterable
 
+from .volumes import VOLUME_SUFFIX, VolumeSet, find_volume_set, is_volume_start, volume_files
+
 _LOG = Callable[[str], None]
 MAX_MEMBER_COUNT = 100_000
 MAX_EXPANDED_BYTES = 20 * 1024**3
@@ -39,6 +41,8 @@ class ExtractionReport:
     extracted_archives: int
     remaining_archives: list[Path] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Kept out of repr so a stray print/log of the report never carries the secret.
+    used_password: str | None = field(default=None, repr=False)
 
 
 def parse_extensions(value: str | Iterable[str]) -> list[str]:
@@ -187,6 +191,11 @@ def _check_cancel(cancel_event: threading.Event | None) -> None:
         raise ExtractionCancelled("用户已取消操作")
 
 
+def check_cancel(cancel_event: threading.Event | None) -> None:
+    """Public alias so sibling modules can reuse the same cancellation semantics."""
+    _check_cancel(cancel_event)
+
+
 def _password_candidates(passwords: Iterable[str] | str | None) -> list[str | None]:
     if passwords is None:
         raw: list[str] = []
@@ -204,14 +213,19 @@ def _password_candidates(passwords: Iterable[str] | str | None) -> list[str | No
 
 
 def _archive_stem(path: Path, extensions: Iterable[str]) -> str:
-    lower_name = path.name.lower()
+    name = path.name
+    volume_match = VOLUME_SUFFIX.match(name)
+    if volume_match:
+        # `M.7z.001` -> `M.7z`, so the output folder is named after the set, not a piece.
+        name = volume_match.group("base")
+    lower_name = name.lower()
     known_suffixes = sorted(set(extensions) | {".tar.gz", ".tar.bz2", ".tar.xz"}, key=len, reverse=True)
     for suffix in known_suffixes:
-        if lower_name.endswith(suffix) and len(path.name) > len(suffix):
-            name = path.name[: -len(suffix)]
+        if lower_name.endswith(suffix) and len(name) > len(suffix):
+            name = name[: -len(suffix)]
             break
     else:
-        name = path.stem or path.name
+        name = Path(name).stem or name
     # Keep output folder names valid on Windows and prevent special directory names.
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     if name in {"", ".", ".."}:
@@ -325,20 +339,25 @@ def _validate_stage_tree(stage: Path) -> None:
     _validate_limits(count, total)
 
 
+def _run_cli(command: list[str], timeout: int) -> subprocess.CompletedProcess[bytes]:
+    """Run an external tool headless, merging stderr into stdout."""
+    return subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
 def _seven_zip_list_paths(executable: str, archive_path: Path, password: str | None) -> None:
     command = [executable, "l", "-slt"]
     if password:
         command.append(f"-p{password}")
     command.append(str(archive_path))
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=60,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    completed = _run_cli(command, 60)
     output = completed.stdout.decode("utf-8", errors="replace")
     if completed.returncode != 0:
         raise RuntimeError("7-Zip 无法读取压缩包目录")
@@ -352,6 +371,18 @@ def _seven_zip_list_paths(executable: str, archive_path: Path, password: str | N
         validate_member_names(names)
 
 
+def _run_7zip_extract(executable: str, archive: Path, stage: Path, password: str | None) -> None:
+    """List then extract ``archive`` with 7z.exe, passing the path verbatim."""
+    _seven_zip_list_paths(executable, archive, password)
+    command = [executable, "x", "-y", f"-o{stage}"]
+    if password:
+        command.append(f"-p{password}")
+    command.append(str(archive))
+    completed = _run_cli(command, 300)
+    if completed.returncode != 0:
+        raise RuntimeError(f"7-Zip 解压失败（退出码 {completed.returncode}）")
+
+
 def _extract_with_7zip(
     source: Path,
     stage: Path,
@@ -359,24 +390,10 @@ def _extract_with_7zip(
     executable: str,
     extension: str,
 ) -> None:
+    # Candidate suffixes are applied to a temporary copy so a wrong suffix can be retried.
     candidate = stage.parent / ("candidate" + extension)
     shutil.copy2(source, candidate)
-    _seven_zip_list_paths(executable, candidate, password)
-    command = [executable, "x", "-y", f"-o{stage}"]
-    if password:
-        command.append(f"-p{password}")
-    command.append(str(candidate))
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=300,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(f"7-Zip 解压失败（退出码 {completed.returncode}）")
+    _run_7zip_extract(executable, candidate, stage, password)
 
 
 def _bandizip_list_paths(executable: str, archive_path: Path, password: str | None) -> None:
@@ -385,15 +402,7 @@ def _bandizip_list_paths(executable: str, archive_path: Path, password: str | No
     if password:
         command.append(f"-p:{password}")
     command.append(str(archive_path))
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=60,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    completed = _run_cli(command, 60)
     output = completed.stdout.decode("utf-8", errors="replace")
     if completed.returncode != 0:
         raise RuntimeError("Bandizip 无法读取压缩包目录（可能需要正确密码或文件已损坏）")
@@ -413,6 +422,20 @@ def _bandizip_list_paths(executable: str, archive_path: Path, password: str | No
         validate_member_names(names)
 
 
+def _run_bandizip_extract(executable: str, archive: Path, stage: Path, password: str | None) -> None:
+    """List then extract ``archive`` with bz.exe, passing the path verbatim."""
+    _bandizip_list_paths(executable, archive, password)
+    command = [executable, "x", "-y", f"-o:{stage}", "-consolemode:utf8"]
+    if password:
+        command.append(f"-p:{password}")
+    command.append(str(archive))
+    completed = _run_cli(command, 300)
+    if completed.returncode != 0:
+        output = completed.stdout.decode("utf-8", errors="replace").strip()
+        detail = f"：{output[-300:]}" if output else ""
+        raise RuntimeError(f"Bandizip 解压失败（退出码 {completed.returncode}）{detail}")
+
+
 def _extract_with_bandizip(
     source: Path,
     stage: Path,
@@ -420,26 +443,10 @@ def _extract_with_bandizip(
     executable: str,
     extension: str,
 ) -> None:
+    # Candidate suffixes are applied to a temporary copy so a wrong suffix can be retried.
     candidate = stage.parent / ("candidate" + extension)
     shutil.copy2(source, candidate)
-    _bandizip_list_paths(executable, candidate, password)
-    command = [executable, "x", "-y", f"-o:{stage}", "-consolemode:utf8"]
-    if password:
-        command.append(f"-p:{password}")
-    command.append(str(candidate))
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=300,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if completed.returncode != 0:
-        output = completed.stdout.decode("utf-8", errors="replace").strip()
-        detail = f"：{output[-300:]}" if output else ""
-        raise RuntimeError(f"Bandizip 解压失败（退出码 {completed.returncode}）{detail}")
+    _run_bandizip_extract(executable, candidate, stage, password)
 
 
 def _attempt_python_backend(source: Path, stage: Path, kind: str, password: str | None) -> None:
@@ -455,6 +462,73 @@ def _attempt_python_backend(source: Path, stage: Path, kind: str, password: str 
         raise RuntimeError("没有适用于该格式的 Python 解压后端")
 
 
+def _extract_volume_set(
+    volume: VolumeSet,
+    destination: Path,
+    *,
+    passwords: list[str | None],
+    bandizip: str | None,
+    seven_zip: str | None,
+    log: _LOG | None,
+    cancel_event: threading.Event | None,
+) -> str | None:
+    """Extract a split set by handing the original `.001` path to an external tool.
+
+    A split archive must never be copied or renamed: the chain is resolved from the file
+    name plus the neighbouring pieces. Python backends cannot handle split volumes at all,
+    so Bandizip or 7-Zip is mandatory here.
+    """
+    _log(log, f"检测到分卷压缩包：{volume.first.name}（共 {volume.count} 卷）")
+    if not volume.is_complete:
+        _log(log, f"警告：分卷不完整，缺少 {volume.describe_missing()}")
+    if not bandizip and not seven_zip:
+        raise ExtractionError(
+            "分卷压缩包需要外部解压程序：请安装 Bandizip（bz.exe）或 7-Zip（7z.exe），并在界面中指定其路径。"
+        )
+
+    backends: list[tuple[str, str, Callable[..., None]]] = []
+    if bandizip:
+        backends.append(("Bandizip", bandizip, _run_bandizip_extract))
+    if seven_zip:
+        backends.append(("7-Zip", seven_zip, _run_7zip_extract))
+
+    external_passwords = [None] + [password for password in passwords if password not in (None, "")]
+    errors: list[str] = []
+
+    for label, executable, runner in backends:
+        for password in external_passwords:
+            _check_cancel(cancel_event)
+            display = "无密码/空密码" if password is None else "用户提供的密码候选"
+            _log(log, f"使用 {label} 尝试分卷 {volume.first.name}（{display}）")
+            with tempfile.TemporaryDirectory(
+                prefix=".unpack-attempt-", dir=destination.parent
+            ) as temp_dir:
+                stage = Path(temp_dir) / "stage"
+                stage.mkdir()
+                try:
+                    runner(executable, volume.first, stage, password)
+                    _validate_stage_tree(stage)
+                    if destination.exists():
+                        raise ExtractionError(f"输出路径已存在：{destination}")
+                    os.replace(stage, destination)
+                    _log(log, f"{label} 解压成功：{volume.first.name}")
+                    return password
+                except UnsafeArchiveError:
+                    raise
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+                    _log(log, f"{label} 本轮未成功（{type(exc).__name__}）")
+
+    if not volume.is_complete:
+        raise ExtractionError(
+            f"无法解压分卷 {volume.first.name}：缺少分卷 {volume.describe_missing()}。"
+        )
+    last_error = errors[-1] if errors else "NoBackend"
+    raise ExtractionError(
+        f"无法解压分卷 {volume.first.name}；已尝试可用后端和候选密码。最后错误类型：{last_error}"
+    )
+
+
 def _extract_one(
     source: Path,
     destination: Path,
@@ -465,11 +539,31 @@ def _extract_one(
     seven_zip_path: str | None,
     log: _LOG | None,
     cancel_event: threading.Event | None,
-) -> None:
+) -> str | None:
+    """Extract one archive and return the password that succeeded, if any.
+
+    ``None`` means no password was needed; ``""`` means the empty password worked.
+    Callers must not print the returned value.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    kind = detect_archive(source)
     bandizip = find_bandizip_executable(bandizip_path)
     seven_zip = find_7zip_executable(seven_zip_path)
+
+    # A split set must reach an external tool with its original path: pulling one piece
+    # out of the chain (copy + rename) makes the archive unreadable.
+    volume = find_volume_set(source)
+    if volume is not None and volume.count > 1:
+        return _extract_volume_set(
+            volume,
+            destination,
+            passwords=passwords,
+            bandizip=bandizip,
+            seven_zip=seven_zip,
+            log=log,
+            cancel_event=cancel_event,
+        )
+
+    kind = detect_archive(source)
     errors: list[str] = []
 
     # Prefer Bandizip for formats it supports. bz.exe provides the `l` command,
@@ -491,7 +585,7 @@ def _extract_one(
                             raise ExtractionError(f"输出路径已存在：{destination}")
                         os.replace(stage, destination)
                         _log(log, f"Bandizip 解压成功：{source.name}")
-                        return
+                        return password
                     except UnsafeArchiveError:
                         raise
                     except Exception as exc:
@@ -516,7 +610,7 @@ def _extract_one(
                         raise ExtractionError(f"输出路径已存在：{destination}")
                     os.replace(stage, destination)
                     _log(log, f"解压成功：{source.name}")
-                    return
+                    return password
                 except UnsafeArchiveError:
                     raise
                 except Exception as exc:
@@ -542,7 +636,7 @@ def _extract_one(
                             raise ExtractionError(f"输出路径已存在：{destination}")
                         os.replace(stage, destination)
                         _log(log, f"7-Zip 解压成功：{source.name}")
-                        return
+                        return password
                     except UnsafeArchiveError:
                         raise
                     except Exception as exc:
@@ -557,7 +651,35 @@ def _extract_one(
     raise ExtractionError(f"无法解压 {source.name}；已尝试可用后端和候选密码。最后错误类型：{errors[-1]}")
 
 def _is_archive_candidate(path: Path, extensions: list[str]) -> bool:
-    return detect_archive(path) is not None or any(path.name.lower().endswith(ext) for ext in extensions)
+    if detect_archive(path) is not None:
+        return True
+    if any(path.name.lower().endswith(ext) for ext in extensions):
+        return True
+    # `M.zip.001` has no central directory in its first piece, so signature detection
+    # fails; a `.001` that owns sibling pieces is a split archive regardless of suffix.
+    return is_volume_start(path)
+
+
+def _delete_nested_archive(
+    archive_path: Path, output_dir: Path, log: _LOG | None, warnings: list[str]
+) -> None:
+    """Remove a nested archive; a split set is removed as a whole, never just `.001`."""
+    pieces = volume_files(archive_path)
+    for piece in pieces:
+        try:
+            piece.unlink()
+        except OSError as exc:
+            message = f"内容已解压，但无法删除 {piece.name}：{exc}"
+            warnings.append(message)
+            _log(log, message)
+            return
+    if len(pieces) > 1:
+        _log(
+            log,
+            f"已移除成功解压的内层分卷（共 {len(pieces)} 个）：{archive_path.relative_to(output_dir)}",
+        )
+    else:
+        _log(log, f"已移除成功解压的内层压缩包：{archive_path.relative_to(output_dir)}")
 
 
 def extract_recursive(
@@ -595,7 +717,7 @@ def extract_recursive(
     _log(log, f"输入文件：{source_path.name}")
     detected = detect_archive(source_path)
     _log(log, f"文件头识别格式：{detected or '未知，将尝试候选后缀'}")
-    _extract_one(
+    top_password = _extract_one(
         source_path,
         output_dir,
         extensions=extension_list,
@@ -644,13 +766,7 @@ def extract_recursive(
                 continue
             extracted_count += 1
             if delete_nested:
-                try:
-                    archive_path.unlink()
-                    _log(log, f"已移除成功解压的内层压缩包：{archive_path.relative_to(output_dir)}")
-                except OSError as exc:
-                    message = f"内容已解压，但无法删除内层压缩包 {archive_path.name}：{exc}"
-                    warnings.append(message)
-                    _log(log, message)
+                _delete_nested_archive(archive_path, output_dir, log, warnings)
             walk_nested(nested_output, parent_depth + 1)
 
     walk_nested(output_dir, 1)
@@ -667,4 +783,5 @@ def extract_recursive(
         extracted_archives=extracted_count,
         remaining_archives=remaining,
         warnings=warnings,
+        used_password=top_password,
     )
