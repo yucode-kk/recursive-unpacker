@@ -6,8 +6,9 @@ import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 
+from . import panels
 from .batch import BatchReport, discover_archives, extract_batch
 from .config import (
     AppConfig,
@@ -25,10 +26,26 @@ from .core import (
     find_bandizip_executable,
     parse_extensions,
 )
+from .volumes import is_volume_start
+from .theme import apply_theme, log_tag_for
 
 DEFAULT_OUTPUT = Path.home() / "Unpacked"
-_ELIDE_LIMIT = 88
+_WINDOW_WIDTH = 1000
+# Fits the "路径" column of the source table; longer values are cut with an ellipsis
+# rather than being silently clipped by the column edge.
+_ELIDE_LIMIT = 56
 _ARCHIVE_TYPES = "*.zip *.7z *.rar *.001 *.bin *.dat *.gz *.xz *.bz2 *.tar"
+
+_STATUS_STYLES = {
+    "idle": "Pill.TLabel",
+    "run": "Run.Pill.TLabel",
+    "ok": "Ok.Pill.TLabel",
+    "warn": "Warn.Pill.TLabel",
+    "error": "Error.Pill.TLabel",
+}
+
+# Minimum number of log lines; the panel then grows with the window.
+_LOG_HEIGHT = 12
 
 
 def _elide(text: str, limit: int = _ELIDE_LIMIT) -> str:
@@ -51,8 +68,7 @@ class RecursiveUnpackerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("递归解压助手")
-        self.root.geometry("960x820")
-        self.root.minsize(820, 700)
+        self.root.minsize(820, 580)
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.cancel_event: threading.Event | None = None
@@ -80,6 +96,11 @@ class RecursiveUnpackerApp:
         self.include_subfolders_var = tk.BooleanVar(value=config.include_subfolders)
         self.status_var = tk.StringVar(value="就绪")
         self.source_count_var = tk.StringVar(value="共 0 项")
+        self.summary_var = tk.StringVar(value="尚未添加待处理项")
+        self.progress_var = tk.StringVar(value="0 / 0")
+        self.metric_vars = {
+            key: tk.StringVar(value="—") for key in ("found", "ok", "failed", "remaining")
+        }
 
         self._build_ui()
         self._refill_passwords(config.passwords)
@@ -91,111 +112,64 @@ class RecursiveUnpackerApp:
     # ------------------------------------------------------------------ layout
 
     def _build_ui(self) -> None:
-        try:
-            style = ttk.Style(self.root)
-            if "vista" in style.theme_names():
-                style.theme_use("vista")
-            elif "clam" in style.theme_names():
-                style.theme_use("clam")
-        except tk.TclError:
-            pass
+        self.fonts = apply_theme(self.root)
 
-        outer = ttk.Frame(self.root, padding=16)
+        outer = ttk.Frame(self.root, padding=(16, 12))
         outer.pack(fill="both", expand=True)
-        outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(8, weight=1)
+        # Workbench split: inputs on the left, run telemetry on the right.
+        outer.columnconfigure(0, weight=5)
+        outer.columnconfigure(1, weight=4)
+        outer.rowconfigure(2, weight=1)
 
-        title = ttk.Label(outer, text="递归解压助手", font=("Microsoft YaHei UI", 18, "bold"))
-        title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-        subtitle = ttk.Label(
-            outer,
-            text="批量处理文件与文件夹，自动识别错误后缀、轮询候选密码，并递归展开内层压缩包。",
-            foreground="#555555",
+        panels.build_header(self, outer)
+        panels.build_status_strip(self, outer)
+
+        left = ttk.Frame(outer)
+        left.grid(row=2, column=0, sticky="nsew", padx=(0, 12))
+        left.columnconfigure(1, weight=1)
+        left.rowconfigure(0, weight=1)
+
+        right = ttk.Frame(outer)
+        right.grid(row=2, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        panels.build_sources_panel(self, left)
+
+        ttk.Label(left, text="输出目录").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        self.output_entry = ttk.Entry(left, textvariable=self.output_var)
+        self.output_entry.grid(row=1, column=1, sticky="ew", padx=(12, 8), pady=(12, 0))
+        self.output_button = ttk.Button(left, text="选择目录…", command=self._choose_output)
+        self.output_button.grid(row=1, column=2, sticky="ew", pady=(12, 0))
+
+        ttk.Label(left, text="尝试后缀").grid(row=2, column=0, sticky="w", pady=(9, 0))
+        self.extensions_entry = ttk.Entry(left, textvariable=self.extensions_var)
+        self.extensions_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(12, 0), pady=(9, 0))
+
+        ttk.Label(left, text="候选密码").grid(row=3, column=0, sticky="nw", pady=(12, 0))
+        self.password_text =         panels.make_text(
+            self, left, height=3, width=34, wrap="none", mono=True, state="normal"
         )
-        subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        self.password_text.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(12, 0), pady=(12, 0))
+        self.password_hint = ttk.Label(left, text="", style="Faint.TLabel", wraplength=430)
+        self.password_hint.grid(row=4, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(4, 0))
 
-        ttk.Label(outer, text="输出目录").grid(row=3, column=0, sticky="w", pady=5)
-        self.output_entry = ttk.Entry(outer, textvariable=self.output_var)
-        self.output_entry.grid(row=3, column=1, sticky="ew", padx=(10, 8), pady=5)
-        self.output_button = ttk.Button(outer, text="选择目录…", command=self._choose_output)
-        self.output_button.grid(row=3, column=2, sticky="ew", pady=5)
-
-        ttk.Label(outer, text="尝试后缀").grid(row=4, column=0, sticky="w", pady=5)
-        self.extensions_entry = ttk.Entry(outer, textvariable=self.extensions_var)
-        self.extensions_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
-
-        password_frame = ttk.Frame(outer)
-        password_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 5))
-        password_frame.columnconfigure(1, weight=1)
-        ttk.Label(password_frame, text="候选密码").grid(row=0, column=0, sticky="nw", padx=(0, 10))
-        self.password_text = scrolledtext.ScrolledText(
-            password_frame, height=4, wrap="none", font=("Consolas", 10)
-        )
-        self.password_text.grid(row=0, column=1, sticky="ew")
-        self.password_hint = ttk.Label(
-            password_frame, text="", foreground="#555555", wraplength=660
-        )
-        self.password_hint.grid(row=1, column=1, sticky="w", pady=(4, 0))
-
-        options = ttk.LabelFrame(outer, text="递归与解压设置", padding=(10, 8))
-        options.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 8))
-        options.columnconfigure(1, weight=1)
-
-        ttk.Label(options, text="最大递归层数").grid(row=0, column=0, sticky="w")
-        self.depth_spin = ttk.Spinbox(options, from_=1, to=20, width=5, textvariable=self.depth_var)
-        self.depth_spin.grid(row=0, column=1, sticky="w", padx=(8, 18))
-        self.subfolder_check = ttk.Checkbutton(
-            options,
-            text="包含子文件夹（扫描子目录）",
-            variable=self.include_subfolders_var,
-        )
-        self.subfolder_check.grid(row=0, column=2, sticky="w", padx=(0, 18))
-        self.delete_nested_check = ttk.Checkbutton(
-            options,
-            text="内层压缩包成功解压后删除原压缩包",
-            variable=self.delete_nested_var,
-        )
-        self.delete_nested_check.grid(row=0, column=3, columnspan=2, sticky="w")
-
-        ttk.Label(options, text="Bandizip 控制台路径（优先，需 bz.exe）").grid(
-            row=1, column=0, sticky="w", pady=(9, 0)
-        )
-        self.bandizip_entry = ttk.Entry(options, textvariable=self.bandizip_var)
-        self.bandizip_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(9, 0))
-        self.bandizip_button = ttk.Button(options, text="浏览…", command=self._choose_bandizip)
-        self.bandizip_button.grid(row=1, column=4, sticky="e", pady=(9, 0))
-
-        ttk.Label(options, text="7-Zip 路径（可选回退）").grid(row=2, column=0, sticky="w", pady=(9, 0))
-        self.seven_zip_entry = ttk.Entry(options, textvariable=self.seven_zip_var)
-        self.seven_zip_entry.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(9, 0))
-        self.seven_zip_button = ttk.Button(options, text="浏览…", command=self._choose_7zip)
-        self.seven_zip_button.grid(row=2, column=4, sticky="e", pady=(9, 0))
-
-        log_header = ttk.Frame(outer)
-        log_header.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 4))
-        log_header.columnconfigure(0, weight=1)
-        ttk.Label(log_header, text="运行日志", font=("Microsoft YaHei UI", 10, "bold")).grid(
-            row=0, column=0, sticky="w"
-        )
-        self.progress = ttk.Progressbar(log_header, mode="determinate", maximum=1, value=0, length=180)
-        self.progress.grid(row=0, column=1, sticky="e")
-
-        self.log_text = scrolledtext.ScrolledText(
-            outer, height=12, wrap="word", state="disabled", font=("Consolas", 9)
-        )
-        self.log_text.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        panels.build_advanced(self, left)
+        panels.build_overview(self, right)
+        panels.build_log_panel(self, right)
 
         bottom = ttk.Frame(outer)
-        bottom.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        bottom.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         bottom.columnconfigure(0, weight=1)
-        ttk.Label(bottom, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
         self.open_button = ttk.Button(
             bottom, text="打开输出目录", command=self._open_output, state="disabled"
         )
         self.open_button.grid(row=0, column=1, padx=(0, 8))
         self.cancel_button = ttk.Button(bottom, text="取消", command=self._cancel, state="disabled")
         self.cancel_button.grid(row=0, column=2, padx=(0, 8))
-        self.start_button = ttk.Button(bottom, text="开始递归解压", command=self._start)
+        self.start_button = ttk.Button(
+            bottom, text="开始递归解压", command=self._start, style="Accent.TButton"
+        )
         self.start_button.grid(row=0, column=3)
 
         note = ttk.Label(
@@ -204,57 +178,54 @@ class RecursiveUnpackerApp:
                 "安全提示：原始文件不会被修改；遇到不安全路径会拒绝解压；达到层数上限时会保留并报告剩余压缩包。"
                 "分卷压缩包请添加 .001（需 Bandizip 或 7-Zip）。密码以明文保存在本机配置文件，不写入运行日志。"
             ),
-            foreground="#555555",
+            style="Faint.TLabel",
             wraplength=900,
         )
-        note.grid(row=10, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        note.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        self._build_sources_panel(outer)
+        self._fit_to_screen()
 
-    def _build_sources_panel(self, outer: ttk.Frame) -> None:
-        panel = ttk.LabelFrame(outer, text="待处理压缩包（可混合添加文件与文件夹）", padding=(10, 8))
-        panel.grid(row=2, column=0, columnspan=3, sticky="ew")
-        panel.columnconfigure(0, weight=1)
+    def _fit_to_screen(self) -> None:
+        """Open at the natural height, but never taller than the display allows."""
+        self.root.update_idletasks()
+        needed = self.root.winfo_reqheight()
+        limit = max(self.root.winfo_screenheight() - 96, 480)
+        self.root.geometry(f"{_WINDOW_WIDTH}x{min(needed, limit)}")
 
-        self.source_list = tk.Listbox(
-            panel,
-            height=6,
-            selectmode="extended",
-            exportselection=False,
-            activestyle="none",
-            font=("Consolas", 9),
-        )
-        self.source_list.grid(row=0, column=0, sticky="ew")
-        scrollbar = ttk.Scrollbar(panel, orient="vertical", command=self.source_list.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.source_list.configure(yscrollcommand=scrollbar.set)
-        self.source_list.bind("<<ListboxSelect>>", self._on_source_select)
-
-        buttons = ttk.Frame(panel)
-        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        buttons.columnconfigure(4, weight=1)
-
-        self.add_files_button = ttk.Button(buttons, text="添加文件…", command=self._add_files)
-        self.add_files_button.grid(row=0, column=0)
-        self.add_folder_button = ttk.Button(buttons, text="添加文件夹…", command=self._add_folder)
-        self.add_folder_button.grid(row=0, column=1, padx=(6, 0))
-        self.remove_button = ttk.Button(buttons, text="移除所选", command=self._remove_selected)
-        self.remove_button.grid(row=0, column=2, padx=(6, 0))
-        self.clear_button = ttk.Button(buttons, text="清空列表", command=self._clear_sources)
-        self.clear_button.grid(row=0, column=3, padx=(6, 0))
-        ttk.Label(buttons, textvariable=self.source_count_var, foreground="#555555").grid(
-            row=0, column=5, sticky="e"
-        )
+    def _toggle_advanced(self) -> None:
+        if self.advanced_var.get():
+            self.advanced_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        else:
+            self.advanced_frame.grid_remove()
+        # Give the extra rows room rather than squeezing the source list.
+        self._fit_to_screen()
 
     # -------------------------------------------------------------- source list
 
+    def _describe_source(self, path: Path) -> tuple[str, str]:
+        """Return ``(kind label, tree tag)`` for a queued path."""
+        try:
+            if not path.exists():
+                return "不存在", "missing"
+        except OSError:
+            return "不存在", "missing"
+        if path.is_dir():
+            return "文件夹", ""
+        if is_volume_start(path):
+            return "分卷", "volume"
+        return "文件", ""
+
     def _on_source_select(self, _event: object = None) -> None:
-        selection = self.source_list.curselection()
+        selection = self.source_tree.selection()
         if not selection:
             return
-        index = selection[-1]
+        try:
+            index = int(selection[-1])
+        except ValueError:
+            return
         if 0 <= index < len(self.source_paths):
             self.status_var.set(str(self.source_paths[index]))
+            self.status_pill.configure(style="Pill.TLabel")
 
     def _add_files(self) -> None:
         selected = filedialog.askopenfilenames(
@@ -285,10 +256,13 @@ class RecursiveUnpackerApp:
             self._append_log(f"已忽略 {skipped} 个重复项。")
 
     def _remove_selected(self) -> None:
-        selection = sorted(self.source_list.curselection(), reverse=True)
-        if not selection:
+        selected = sorted(
+            (int(iid) for iid in self.source_tree.selection() if iid.isdigit()),
+            reverse=True,
+        )
+        if not selected:
             return
-        for index in selection:
+        for index in selected:
             if 0 <= index < len(self.source_paths):
                 del self.source_paths[index]
         self._refresh_source_list()
@@ -298,10 +272,22 @@ class RecursiveUnpackerApp:
         self._refresh_source_list()
 
     def _refresh_source_list(self) -> None:
-        self.source_list.delete(0, "end")
-        for path in self.source_paths:
-            self.source_list.insert("end", _elide(str(path)))
-        self.source_count_var.set(f"共 {len(self.source_paths)} 项")
+        for iid in self.source_tree.get_children():
+            self.source_tree.delete(iid)
+        for index, path in enumerate(self.source_paths):
+            kind, tag = self._describe_source(path)
+            self.source_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(_elide(str(path)), kind),
+                tags=(tag,) if tag else (),
+            )
+        count = len(self.source_paths)
+        self.source_count_var.set(f"共 {count} 项")
+        self.summary_var.set(
+            f"已添加 {count} 项" if count else "尚未添加待处理项"
+        )
         if self._busy:
             self.remove_button.configure(state="disabled")
             self.clear_button.configure(state="disabled")
@@ -382,11 +368,20 @@ class RecursiveUnpackerApp:
 
     # --------------------------------------------------------------------- run
 
-    def _append_log(self, message: str) -> None:
+    def _append_log(self, message: str, tag: str | None = None) -> None:
+        if tag is None:
+            tag = log_tag_for(message)
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", message + "\n")
+        if tag:
+            self.log_text.insert("end", message + "\n", tag)
+        else:
+            self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _set_status(self, message: str, kind: str = "idle") -> None:
+        self.status_var.set(message)
+        self.status_pill.configure(style=_STATUS_STYLES.get(kind, "Pill.TLabel"))
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -406,7 +401,7 @@ class RecursiveUnpackerApp:
             self.delete_nested_check,
         ):
             widget.configure(state=state)
-        self.source_list.configure(state="normal" if not busy else "disabled")
+        self.source_tree.configure(selectmode="none" if busy else "extended")
         self.password_text.configure(state=state)
         if busy:
             self.remove_button.configure(state="disabled")
@@ -468,7 +463,11 @@ class RecursiveUnpackerApp:
         self._set_busy(True)
         self.progress.configure(mode="indeterminate", maximum=1, value=0)
         self.progress.start(12)
-        self.status_var.set("正在扫描待处理文件…")
+        self._set_status("正在扫描待处理文件…", "run")
+        self.progress_var.set("扫描中")
+        self.metric_vars["found"].set("扫描中")
+        for key in ("ok", "failed", "remaining"):
+            self.metric_vars[key].set("—")
         self._append_log("\n" + "=" * 54)
 
         def worker_main() -> None:
@@ -511,7 +510,7 @@ class RecursiveUnpackerApp:
     def _cancel(self) -> None:
         if self.cancel_event:
             self.cancel_event.set()
-            self.status_var.set("正在请求取消；当前解压操作结束后停止…")
+            self._set_status("正在请求取消；当前解压操作结束后停止…", "warn")
             self._append_log("已请求取消。")
             self.cancel_button.configure(state="disabled")
 
@@ -532,18 +531,21 @@ class RecursiveUnpackerApp:
                     total = int(payload) if isinstance(payload, int) else 0
                     self.progress.stop()
                     self.progress.configure(mode="determinate", maximum=max(total, 1), value=0)
-                    self.status_var.set(
-                        f"共发现 {total} 个压缩包" if total else "未发现匹配的压缩包"
-                    )
+                    label = f"共发现 {total} 个压缩包" if total else "未发现匹配的压缩包"
+                    self.summary_var.set(label)
+                    self._set_status(label, "run" if total else "warn")
+                    self.metric_vars["found"].set(str(total))
+                    self.progress_var.set(f"0 / {total}")
                 elif kind == "progress":
                     index, total, name = payload  # type: ignore[misc]
                     self.progress.configure(value=index)
-                    self.status_var.set(f"正在处理 {index}/{total}：{name}")
+                    self.progress_var.set(f"{index} / {total}")
+                    self._set_status(f"正在处理 {index}/{total}：{name}", "run")
                 elif kind == "done":
                     self._handle_done(payload)
                 elif kind == "error":
                     self._finish()
-                    self.status_var.set("处理失败")
+                    self._set_status("处理失败", "error")
                     self._append_log(f"错误：{payload}")
                     messagebox.showerror("解压失败", str(payload), parent=self.root)
                 elif kind == "cancelled":
@@ -552,29 +554,40 @@ class RecursiveUnpackerApp:
             pass
         self.root.after(100, self._poll_messages)
 
+    def _apply_metrics(self, succeeded: int, failed: int, remaining: int) -> None:
+        self.metric_vars["ok"].set(str(succeeded))
+        self.metric_vars["failed"].set(str(failed))
+        self.metric_vars["remaining"].set(str(remaining))
+
     def _handle_done(self, payload: object) -> None:
         self._finish()
         if isinstance(payload, BatchReport):
             self.last_output = payload.output_base
             self.open_button.configure(state="normal")
+            self._apply_metrics(
+                len(payload.succeeded), len(payload.failed), len(payload.remaining_archives)
+            )
             self._present_batch_report(payload)
             return
         if isinstance(payload, ExtractionReport):
             self.last_output = payload.output_dir
             self.open_button.configure(state="normal")
-            self.status_var.set(f"完成：已解压 {payload.extracted_archives} 个压缩包")
+            self._apply_metrics(payload.extracted_archives, 0, len(payload.remaining_archives))
+            self._set_status(f"完成：已解压 {payload.extracted_archives} 个压缩包", "ok")
             return
-        self.status_var.set("处理结束")
+        self._set_status("处理结束", "warn")
         self._append_log(f"未知结果类型：{type(payload).__name__}")
 
     def _present_batch_report(self, report: BatchReport) -> None:
         total = report.total
         failed = report.failed
         remaining = len(report.remaining_archives)
-        self.status_var.set(
+        self._set_status(
             f"完成：成功 {len(report.succeeded)}/{total}"
-            + (f"，失败 {len(failed)}" if failed else "")
+            + (f"，失败 {len(failed)}" if failed else ""),
+            "ok" if not failed else "warn",
         )
+        self.summary_var.set(f"成功 {len(report.succeeded)}/{total}，累计解压 {report.extracted_archives} 个")
         if not total:
             messagebox.showinfo(
                 "没有可处理的压缩包",
@@ -606,9 +619,12 @@ class RecursiveUnpackerApp:
 
     def _handle_cancelled(self, payload: object) -> None:
         self._finish()
-        self.status_var.set("已取消")
+        self._set_status("已取消", "warn")
         self._append_log("操作已取消。")
         if isinstance(payload, BatchReport) and payload.total:
+            self._apply_metrics(
+                len(payload.succeeded), len(payload.failed), len(payload.remaining_archives)
+            )
             self._append_log(
                 f"取消前已完成 {len(payload.succeeded)}/{payload.total}，"
                 f"输出目录：{payload.output_base}"

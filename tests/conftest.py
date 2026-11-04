@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from pathlib import Path
 
@@ -33,6 +34,32 @@ def no_external_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(core, "find_bandizip_executable", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(core, "find_7zip_executable", lambda *_args, **_kwargs: None)
+
+
+@pytest.fixture(scope="session")
+def tk_root():
+    """One hidden Tk interpreter shared by every GUI test.
+
+    Creating a fresh ``Tk()`` per test intermittently raises ``TclError`` on Windows,
+    which silently downgraded real assertions into skips.
+    """
+    tkinter = pytest.importorskip("tkinter")
+    last: Exception | None = None
+    for _attempt in range(3):
+        try:
+            root = tkinter.Tk()
+            break
+        except tkinter.TclError as exc:  # pragma: no cover - environment dependent
+            last = exc
+            time.sleep(0.2)
+    else:  # pragma: no cover - environment dependent
+        pytest.skip(f"no display available: {last}")
+    root.withdraw()
+    yield root
+    try:
+        root.destroy()
+    except tkinter.TclError:
+        pass
 
 
 @pytest.fixture

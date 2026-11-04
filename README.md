@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg)](#环境要求)
-[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg)](recursive_unpacker/__init__.py)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg)](recursive_unpacker/__init__.py)
 
 </div>
 
@@ -158,14 +158,17 @@ recursive-unpacker/
 │   ├── volumes.py              # 分卷压缩包识别（.7z.001 等）与整组删除
 │   ├── batch.py                # 多源发现、批量编排、会话内密码提升
 │   ├── config.py               # 本机设置文件：路径解析、容错读取、原子写入
-│   └── gui.py                  # Tkinter 图形界面
+│   ├── theme.py                # 配色、字体与 ttk 样式（clam 主题）
+│   ├── panels.py               # 左右工作台各分区的控件构建
+│   └── gui.py                  # Tkinter 图形界面（事件、线程与流程）
 ├── tests/
 │   ├── conftest.py             # 公共 fixture（内存造包、屏蔽外部后端、临时配置）
 │   ├── test_core.py            # 核心解压与安全校验测试
 │   ├── test_volumes.py         # 分卷识别与缺卷检测测试
 │   ├── test_batch.py           # 批量发现与编排测试
 │   ├── test_config.py          # 设置文件读写与容错测试
-│   ├── test_gui.py             # 界面纯函数与密码回填测试
+│   ├── test_theme.py           # 样式映射与日志着色规则测试
+│   ├── test_gui.py             # 界面纯函数、列表类型列与密码回填测试
 │   └── test_version.py         # 校验 version_info.txt 与 __version__ 一致
 ├── config.json                 # 本机生成，含明文密码，已被 .gitignore 排除
 ├── version_info.txt            # Windows 版本资源（单表达式，PyInstaller 用 eval 加载）
